@@ -1,172 +1,377 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# docker-install.sh
+# Interactive one-click Docker installer with many options.
+# Supports Debian/Ubuntu and RHEL/CentOS/Fedora/Alma/Rocky.
+# Requires root privileges.
 
-# =======================================================================
-# Docker 自动安装脚本 (全版本列表版)
-# =======================================================================
+set -euo pipefail
+IFS=$'\n\t'
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# -------------------------
+# Utility
+# -------------------------
+log() { echo -e "\e[1;32m[INFO]\e[0m $*"; }
+warn() { echo -e "\e[1;33m[WARN]\e[0m $*"; }
+err()  { echo -e "\e[1;31m[ERR]\e[0m $*" >&2; }
+confirm() {
+  local prompt="${1:-Proceed? (y/N)}"
+  local default="${2:-N}"
+  read -r -p "$prompt " answer
+  answer="${answer:-$default}"
+  [[ "$answer" =~ ^([yY])$ ]]
+}
 
-# 检查 Root 权限
-if [ $(id -u) -ne 0 ]; then
-    echo -e "${RED}错误：请使用 root 权限运行 (sudo ./install_docker.sh)${NC}"
-    exit 1
+# Ensure running as root or via sudo
+if [[ "$EUID" -ne 0 ]]; then
+  err "This script must be run as root. Re-run with sudo."
+  exit 1
 fi
 
-# 1. 系统检测
-echo -e "${BLUE}>>> 正在检测操作系统...${NC}"
+# -------------------------
+# Detect OS
+# -------------------------
+OS=""
+OS_FAMILY=""
+PKG_MANAGER=""
 if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
+  . /etc/os-release
+  OS=$ID
+  OS_LIKE=${ID_LIKE:-}
+  if [[ "$OS" =~ ^(ubuntu|debian)$ ]]; then
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt-get"
+  elif [[ "$OS" =~ ^(centos|rhel|rocky|almalinux)$ ]] || [[ "$OS_LIKE" =~ (rhel|fedora) ]]; then
+    OS_FAMILY="rhel"
+    # prefer dnf if available
+    if command -v dnf >/dev/null 2>&1; then
+      PKG_MANAGER="dnf"
+    else
+      PKG_MANAGER="yum"
+    fi
+  elif [[ "$OS" =~ ^(fedora)$ ]]; then
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+  else
+    # fallback checks
+    if command -v apt-get >/dev/null 2>&1; then
+      OS_FAMILY="debian"; PKG_MANAGER="apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+      OS_FAMILY="rhel"; PKG_MANAGER="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+      OS_FAMILY="rhel"; PKG_MANAGER="yum"
+    else
+      err "Unsupported OS. Exiting."
+      exit 2
+    fi
+  fi
 else
-    echo -e "${RED}无法识别操作系统，脚本退出。${NC}"
-    exit 1
+  err "/etc/os-release not found. Unsupported system."
+  exit 2
 fi
-echo -e "${GREEN}系统识别为: $OS $VERSION_ID${NC}"
 
-# 2. 卸载旧版本
-echo -e "\n${BLUE}>>> 正在清理旧版本...${NC}"
-if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-    apt-get remove -y docker docker-engine docker.io containerd runc &> /dev/null
-elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "alinux" ]]; then
-    yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine &> /dev/null
+log "Detected OS: $OS (family: $OS_FAMILY), package manager: $PKG_MANAGER"
+
+# -------------------------
+# Options (interactive)
+# -------------------------
+echo
+log "安装选项配置（按回车为默认）:"
+read -r -p "是否安装 Docker Engine (y/N)？ " opt_install_docker
+opt_install_docker=${opt_install_docker:-y}
+
+read -r -p "是否安装 Docker Compose 插件（官方 plugin，推荐，y/N）？ " opt_compose_plugin
+opt_compose_plugin=${opt_compose_plugin:-y}
+
+read -r -p "是否安装 docker-compose v2 二进制（兼容旧系统/手动方式）？ (y/N) " opt_compose_bin
+opt_compose_bin=${opt_compose_bin:-n}
+
+read -r -p "是否配置 daemon.json（registry mirror / log / storage）？ (y/N) " opt_config_daemon
+opt_config_daemon=${opt_config_daemon:-y}
+
+read -r -p "是否添加当前非 root 用户到 docker 组（允许无 sudo 使用 Docker）？ (y/N) " opt_add_user
+opt_add_user=${opt_add_user:-y}
+CURRENT_USER="${SUDO_USER:-root}"
+
+read -r -p "是否安装 rootless 模式（仅当需要非 root 启动 dockerd 时）？ (y/N) " opt_rootless
+opt_rootless=${opt_rootless:-n}
+
+read -r -p "是否在安装后运行 hello-world 测试镜像？ (y/N) " opt_test_hello
+opt_test_hello=${opt_test_hello:-y}
+
+# defaults for daemon config if user opts in
+REGISTRY_MIRROR=""
+LOG_DRIVER="json-file"
+LOG_MAX_SIZE="10m"
+STORAGE_DRIVER="overlay2"
+INSECURE_REGISTRIES=""
+if [[ "$opt_config_daemon" =~ ^([yY]) ]]; then
+  read -r -p "设置 registry mirror (例如 https://registry.docker-cn.com) 或留空跳过: " REGISTRY_MIRROR
+  REGISTRY_MIRROR=${REGISTRY_MIRROR:-""}
+  read -r -p "日志驱动 (默认 json-file): " tmp; LOG_DRIVER=${tmp:-$LOG_DRIVER}
+  read -r -p "日志单文件大小上限 (默认 ${LOG_MAX_SIZE}): " tmp; LOG_MAX_SIZE=${tmp:-$LOG_MAX_SIZE}
+  read -r -p "存储驱动 (默认 ${STORAGE_DRIVER}): " tmp; STORAGE_DRIVER=${tmp:-$STORAGE_DRIVER}
+  read -r -p "是否配置不安全私有仓库(insecure registries)，多个用逗号分隔 (留空跳过): " INSECURE_REGISTRIES
 fi
-echo -e "${GREEN}清理完成。${NC}"
 
-# 3. 配置镜像源
-echo -e "\n${BLUE}>>> 选择下载源：${NC}"
-echo "1) 阿里云 (推荐国内)"
-echo "2) 清华大学"
-echo "3) 官方源 (推荐国外)"
-read -p "请输入选项 [默认: 1]: " MIRROR
-MIRROR=${MIRROR:-1}
+# -------------------------
+# Pre-checks & Dependencies
+# -------------------------
+install_packages() {
+  local pkgs=("$@")
+  if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends "${pkgs[@]}"
+  else
+    # dnf/yum
+    if command -v dnf >/dev/null 2>&1; then
+      dnf makecache -y || true
+      dnf install -y "${pkgs[@]}"
+    else
+      yum makecache -y || true
+      yum install -y "${pkgs[@]}"
+    fi
+  fi
+}
 
-case $MIRROR in
-    1) BASE_URL="https://mirrors.aliyun.com/docker-ce"; NAME="阿里云";;
-    2) BASE_URL="https://mirrors.tuna.tsinghua.edu.cn/docker-ce"; NAME="清华源";;
-    3) BASE_URL="https://download.docker.com"; NAME="官方源";;
-    *) BASE_URL="https://mirrors.aliyun.com/docker-ce"; NAME="阿里云";;
-esac
-echo -e "${YELLOW}已选择：$NAME${NC}"
+# -------------------------
+# Install Docker (official)
+# -------------------------
+install_docker_official() {
+  log "Installing Docker (official packages)..."
 
-# 4. 安装依赖并配置仓库 (这是获取版本列表的前提)
-echo -e "\n${BLUE}>>> 正在配置仓库环境...${NC}"
-if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-    apt-get update -qq
-    apt-get install -y ca-certificates curl gnupg
-    install -m 0755 -d /etc/apt/keyrings
-    rm -f /etc/apt/keyrings/docker.gpg
-    curl -fsSL "$BASE_URL/linux/$OS/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    install_packages ca-certificates curl gnupg lsb-release
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/"$OS"/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] $BASE_URL/linux/$OS $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt-get update -qq
-elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "alinux" ]]; then
-    yum install -y yum-utils
-    yum-config-manager --add-repo $BASE_URL/linux/centos/docker-ce.repo
-    if [ "$MIRROR" != "3" ]; then
-        sed -i "s|https://download.docker.com|$BASE_URL|g" /etc/yum.repos.d/docker-ce.repo
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS \
+      $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || {
+      warn "apt install failed; trying to install core packages only"
+      apt-get install -y docker-ce docker-ce-cli containerd.io || true
+    }
+  else
+    # RHEL family
+    install_packages yum-utils ca-certificates curl
+    # add repo and install
+    if command -v dnf >/dev/null 2>&1; then
+      dnf -y install dnf-plugins-core
     fi
-    yum makecache
-fi
-
-# 5. 版本选择 (逻辑升级)
-echo -e "\n${BLUE}>>> 选择 Docker 版本：${NC}"
-echo "1) 自动安装最新版 (Latest) [默认]"
-echo "2) 选择特定版本 (列出所有可用版本)"
-read -p "请输入选项: " VER_OPT
-VER_OPT=${VER_OPT:-1}
-
-TARGET_VERSION=""
-
-if [ "$VER_OPT" == "2" ]; then
-    echo -e "${YELLOW}正在从仓库获取全量版本列表，可能需要几秒钟...${NC}"
-    
-    # 定义数组
-    declare -a VERSION_LIST
-    
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        # apt-cache madison 本身通常是按版本降序排列的，但我们强制 awk 提取并确保格式
-        # 去掉 head -n 限制，获取全部
-        RAW_LIST=$(apt-cache madison docker-ce | awk '{print $3}')
-        
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "alinux" ]]; then
-        # yum list 输出较乱，需要严格过滤和排序
-        # sort -V -r : 按版本号(Version)进行逆序(Reverse)排序，即由新到旧
-        RAW_LIST=$(yum list docker-ce --showduplicates | grep "docker-ce" | awk '{print $2}' | sort -V -r)
+    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || true
+    if command -v dnf >/dev/null 2>&1; then
+      dnf makecache || true
+      dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || {
+        warn "dnf install failed; trying yum"
+        yum install -y docker-ce docker-ce-cli containerd.io || true
+      }
+    else
+      yum makecache fast || true
+      yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
     fi
+  fi
 
-    # 转为数组
-    i=1
-    for v in $RAW_LIST; do
-        VERSION_LIST[$i]=$v
-        ((i++))
-    done
+  # ensure systemd service
+  systemctl daemon-reload || true
+  systemctl enable --now docker || true
+  log "Docker service started and enabled."
+}
 
-    # 检查是否有版本
-    if [ ${#VERSION_LIST[@]} -eq 0 ]; then
-        echo -e "${RED}未获取到任何版本信息，请检查网络或源配置。${NC}"
-        exit 1
+# -------------------------
+# Install docker-compose binary (optional)
+# -------------------------
+install_compose_binary() {
+  log "Installing docker-compose (standalone binary v2)..."
+  # find latest stable release via GitHub API is network-dependent; pick v2 stable fallback
+  # We'll try to fetch latest tag; if fails, fallback to 2.20.2
+  COMPOSE_VERSION="2.20.2"
+  if command -v curl >/dev/null 2>&1; then
+    # best-effort get latest release tag
+    latest=$(curl -fsSL https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    if [[ -n "$latest" ]]; then
+      COMPOSE_VERSION="${latest#v}"
     fi
+  fi
+  BIN_PATH="/usr/local/bin/docker-compose"
+  curl -L "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o "$BIN_PATH"
+  chmod +x "$BIN_PATH"
+  log "Installed docker-compose ${COMPOSE_VERSION} at ${BIN_PATH}"
+}
 
-    echo -e "\n${BLUE}====== 可用版本列表 (按时间/版本倒序) ======${NC}"
-    echo -e "${YELLOW}序号\t版本号${NC}"
-    
-    # 打印所有版本
-    for idx in "${!VERSION_LIST[@]}"; do
-        echo -e "$idx)\t${VERSION_LIST[$idx]}"
-    done
-    echo -e "${BLUE}==============================================${NC}"
-    
-    # 交互选择
-    while true; do
-        read -p "请输入要安装的版本对应的 [数字序号]: " V_INDEX
-        # 检查输入是否为数字
-        if [[ "$V_INDEX" =~ ^[0-9]+$ ]]; then
-            if [ -n "${VERSION_LIST[$V_INDEX]}" ]; then
-                TARGET_VERSION="${VERSION_LIST[$V_INDEX]}"
-                echo -e "${GREEN}>>> 您已选择: $TARGET_VERSION${NC}"
-                break
-            else
-                echo -e "${RED}序号不存在，请重新输入。${NC}"
-            fi
-        else
-            echo -e "${RED}请输入有效的数字。${NC}"
-        fi
-    done
-fi
+# -------------------------
+# Configure daemon.json
+# -------------------------
+configure_daemon_json() {
+  local cfg_file="/etc/docker/daemon.json"
+  mkdir -p /etc/docker
+  # read existing if any
+  local existing="{}"
+  if [[ -f "$cfg_file" ]]; then
+    existing=$(cat "$cfg_file")
+  fi
 
-# 6. 执行安装
-echo -e "\n${BLUE}>>> 开始安装...${NC}"
-PKG_NAME=""
-if [ -z "$TARGET_VERSION" ]; then
-    PKG_NAME="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+  # Build new JSON using simple method (jq would be nicer, but not always installed)
+  # We'll create a safe file and then move
+  tmpf=$(mktemp)
+  cat > "$tmpf" <<EOF
+{
+  "storage-driver": "${STORAGE_DRIVER}",
+  "log-driver": "${LOG_DRIVER}",
+  "log-opts": {
+    "max-size": "${LOG_MAX_SIZE}"
+  }$(if [[ -n "$REGISTRY_MIRROR" ]]; then echo ",\n  \"registry-mirrors\": [\"$REGISTRY_MIRROR\"]"; fi)$(if [[ -n "$INSECURE_REGISTRIES" ]]; then
+    # convert comma separated to JSON array
+    echo ",\n  \"insecure-registries\": [$(printf '%s' "$INSECURE_REGISTRIES" | awk -F',' '{for(i=1;i<=NF;i++){printf "\"%s\"%s",$i,(i==NF?"":",")}}') ]"
+  fi)
+}
+EOF
+  # Validate JSON lightly
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PYTHON_CHECK
+import json,sys
+try:
+    with open("$tmpf") as f:
+        json.load(f)
+except Exception as e:
+    print("JSON_ERR", e)
+    sys.exit(2)
+print("OK")
+PYTHON_CHECK
+  fi
+  mv "$tmpf" "$cfg_file"
+  chmod 644 "$cfg_file"
+  log "Wrote $cfg_file"
+  systemctl restart docker || warn "failed to restart docker; please check 'systemctl status docker'"
+}
+
+# -------------------------
+# Add user to docker group
+# -------------------------
+add_user_to_docker() {
+  local user="$1"
+  if id "$user" &>/dev/null; then
+    groupadd -f docker || true
+    usermod -aG docker "$user" || warn "usermod returned non-zero"
+    log "Added $user to docker group. They may need to re-login to apply group membership."
+  else
+    warn "User $user doesn't exist; skipping add to docker group."
+  fi
+}
+
+# -------------------------
+# Check existing docker
+# -------------------------
+if command -v docker >/dev/null 2>&1 && [[ "${opt_install_docker}" =~ ^([yY]) ]]; then
+  warn "Docker is already installed. You can still run configuration steps or choose to reinstall/uninstall later."
+  if confirm "是否重新安装/覆盖 Docker？ (y/N)" "N"; then
+    REINSTALL=true
+  else
+    REINSTALL=false
+  fi
 else
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        PKG_NAME="docker-ce=$TARGET_VERSION docker-ce-cli=$TARGET_VERSION containerd.io docker-buildx-plugin docker-compose-plugin"
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "alinux" ]]; then
-        # CentOS 有时版本字符串带 epoch (如 3:20.10.x)，直接拼接即可
-        PKG_NAME="docker-ce-$TARGET_VERSION docker-ce-cli-$TARGET_VERSION containerd.io docker-buildx-plugin docker-compose-plugin"
+  REINSTALL=false
+fi
+
+# -------------------------
+# Main flow
+# -------------------------
+if [[ "${opt_install_docker}" =~ ^([yY]) ]]; then
+  if [[ "$REINSTALL" == true ]]; then
+    log "Removing existing docker packages (best-effort)..."
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+      apt-get remove -y docker docker-engine docker.io containerd runc || true
+    else
+      if command -v dnf >/dev/null 2>&1; then
+        dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine || true
+      else
+        yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine || true
+      fi
     fi
+  fi
+
+  install_docker_official
 fi
 
-if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-    apt-get install -y $PKG_NAME
-elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "alinux" ]]; then
-    yum install -y $PKG_NAME
+# Compose plugin
+if [[ "${opt_compose_plugin}" =~ ^([yY]) ]]; then
+  if command -v docker-compose >/dev/null 2>&1; then
+    log "A docker-compose binary already exists; skipping plugin install."
+  fi
+  # If plugin available as package, it's likely already installed with engine install above.
+  if ! docker compose version >/dev/null 2>&1; then
+    log "Ensuring docker compose plugin is installed."
+    # Most distros installed plugin already with docker packages. If not, fallback to plugin install instructions:
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+      apt-get update -y
+      apt-get install -y docker-compose-plugin || true
+    else
+      if command -v dnf >/dev/null 2>&1; then
+        dnf install -y docker-compose-plugin || true
+      else
+        yum install -y docker-compose-plugin || true
+      fi
+    fi
+  fi
+  log "docker compose plugin installed (or already present)."
 fi
 
-# 7. 启动与配置
-echo -e "\n${BLUE}>>> 配置服务...${NC}"
-systemctl start docker
-systemctl enable docker
+# optional binary
+if [[ "${opt_compose_bin}" =~ ^([yY]) ]]; then
+  install_compose_binary
+fi
 
-echo -e "\n${GREEN}========================================${NC}"
-echo -e "${GREEN}   Docker 安装成功！${NC}"
-echo -e "${GREEN}========================================${NC}"
-docker --version
+# configure daemon.json
+if [[ "${opt_config_daemon}" =~ ^([yY]) ]]; then
+  configure_daemon_json
+fi
 
-echo -e "\n${YELLOW}提示：非 root 用户请执行: sudo usermod -aG docker \$USER && newgrp docker${NC}"
+# add current user to docker group
+if [[ "${opt_add_user}" =~ ^([yY]) ]]; then
+  if [[ "$CURRENT_USER" != "root" ]]; then
+    add_user_to_docker "$CURRENT_USER"
+  else
+    warn "Current sudo user not detected (running as root); skipping user add. If you want to add e.g. 'ubuntu' run: usermod -aG docker <username>"
+  fi
+fi
+
+# rootless install (best-effort)
+if [[ "${opt_rootless}" =~ ^([yY]) ]]; then
+  log "Attempting to install dockerd-rootless-setuptool..."
+  if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1; then
+    install_packages uidmap
+  fi
+  # install rootless tool script
+  su - "$SUDO_USER" -c "curl -fsSL https://get.docker.com/rootless | sh" || warn "Rootless installer returned non-zero. Please check output above."
+  log "Rootless install attempted. Follow any printed instructions to enable it for your user."
+fi
+
+# optionally test
+if [[ "${opt_test_hello}" =~ ^([yY]) ]]; then
+  log "Running docker hello-world test..."
+  if docker run --rm hello-world >/dev/null 2>&1; then
+    log "hello-world ran successfully."
+  else
+    warn "hello-world test failed. If using rootless or custom daemon json, check logs: journalctl -u docker -n 200 --no-pager"
+  fi
+fi
+
+# Final tips
+cat <<EOF
+
+安装完成 ✅
+
+下一步建议：
+- 如果你将非 root 用户添加到了 docker 组，请重新登录该用户以应用组权限（或运行 newgrp docker）。
+- 检查 docker 服务状态：  systemctl status docker
+- 如果需要查看 daemon.json：  cat /etc/docker/daemon.json
+- 若需卸载或清理，请运行本脚本并选择卸载（脚本下一版本可加入交互卸载选项）
+
+常用命令：
+- docker version
+- docker info
+- docker compose version  (或 docker-compose --version 如果安装了二进制)
+- journalctl -u docker -f
+
+EOF
