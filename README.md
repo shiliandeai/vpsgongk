@@ -5,3 +5,10 @@
 wget -O dockerwanneng.sh https://raw.githubusercontent.com/shiliandeai/vpsgongk/main/dockerwanneng.sh && chmod +x dockerwanneng.sh && ./dockerwanneng.sh
 
 
+
+
+# VPS 一键改DNS万能脚本
+
+
+```bash
+wget -O dockerwanneng.sh https://raw.githubusercontent.com/shiliandeai/vpsgongk/main/dns.sh && chmod +x dns.sh && ./dns.sh
