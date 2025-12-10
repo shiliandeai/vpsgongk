@@ -1,272 +1,129 @@
 #!/usr/bin/env bash
-# change_dns.sh
-# 用途：在 VPS 上修改 DNS（可交互或通过命令行参数），支持 systemd-resolved / NetworkManager / 直接写 /etc/resolv.conf
-# 并对指定 DNS 进行连通性验证。
-#
-# 使用：
-#   sudo ./change_dns.sh 1.1.1.1 8.8.8.8
-#   sudo ./change_dns.sh           # 交互式输入
-#
-# 说明：脚本会在修改前自动备份涉及的配置文件到 /root/dns-backup-<timestamp>/
+# reset_dns.sh
+# 作用：彻底关闭本地 DNS（systemd-resolved / 127.0.0.53）
+#       重建为用户自定义 DNS，并进行验证
+# 适用：Ubuntu / Debian / CentOS / Alma / Rocky / Fedora / VPS 通用
 
-set -euo pipefail
+set -e
 
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="/root/dns-backup-${TIMESTAMP}"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="/root/dns-reset-backup-$TIMESTAMP"
 mkdir -p "$BACKUP_DIR"
 
-# helper: print usage
-usage() {
-  cat <<EOF
-Usage:
-  sudo $0 DNS1 [DNS2 ...]
-  sudo $0            # 交互式输入
-Example:
-  sudo $0 1.1.1.1 8.8.8.8
+echo "📦 备份目录：$BACKUP_DIR"
 
-This script tries in order:
-  1) systemd-resolved (resolvectl or systemctl)
-  2) NetworkManager (nmcli)
-  3) fallback: overwrite /etc/resolv.conf (backed up first)
-
-It will then test the given DNS servers (using dig/nslookup/host).
-EOF
-  exit 1
-}
-
-# Get DNS servers from args or prompt
+# ----------------------------
+# 1. 读取用户 DNS
+# ----------------------------
 if [ "$#" -gt 0 ]; then
   DNS_SERVERS=("$@")
 else
-  read -rp "请输入 DNS（用空格分隔多个，例如 1.1.1.1 8.8.8.8）: " -a DNS_SERVERS
-  if [ "${#DNS_SERVERS[@]}" -eq 0 ]; then
-    echo "未输入 DNS，退出。"
-    usage
+  read -rp "请输入新的 DNS（空格分隔，如 1.1.1.1 8.8.8.8）： " -a DNS_SERVERS
+fi
+
+if [ "${#DNS_SERVERS[@]}" -eq 0 ]; then
+  echo "❌ 未输入 DNS，退出"
+  exit 1
+fi
+
+echo "✅ 新 DNS：${DNS_SERVERS[*]}"
+sleep 1
+
+# ----------------------------
+# 2. 彻底关闭 systemd-resolved
+# ----------------------------
+if systemctl list-unit-files | grep -q systemd-resolved; then
+  echo "🛑 关闭 systemd-resolved..."
+  systemctl stop systemd-resolved || true
+  systemctl disable systemd-resolved || true
+
+  cp -a /etc/systemd/resolved.conf "$BACKUP_DIR/" 2>/dev/null || true
+fi
+
+# ----------------------------
+# 3. 解除 resolv.conf 软链接
+# ----------------------------
+if [ -L /etc/resolv.conf ]; then
+  echo "🔗 解除 /etc/resolv.conf 软链接"
+  cp -a /etc/resolv.conf "$BACKUP_DIR/resolv.conf.link.bak"
+  rm -f /etc/resolv.conf
+fi
+
+# ----------------------------
+# 4. 关闭 NetworkManager 自动 DNS
+# ----------------------------
+if command -v nmcli >/dev/null 2>&1; then
+  echo "🛑 禁止 NetworkManager 自动控制 DNS"
+  NM_CONN=$(nmcli -t -f NAME c show --active | head -n1)
+  if [ -n "$NM_CONN" ]; then
+    nmcli c modify "$NM_CONN" ipv4.ignore-auto-dns yes || true
+    nmcli c modify "$NM_CONN" ipv6.ignore-auto-dns yes || true
+    nmcli c up "$NM_CONN" || true
   fi
 fi
 
-echo "将设置的 DNS: ${DNS_SERVERS[*]}"
-
-# utilities detection
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# get default outgoing interface
-get_default_iface() {
-  # ip route get 8.8.8.8 用法在大多数系统有效
-  if has_cmd ip; then
-    ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
-  else
-    echo ""
-  fi
-}
-
-# backup helper
-backup_file() {
-  local f="$1"
-  if [ -e "$f" ]; then
-    mkdir -p "$BACKUP_DIR/$(dirname "$f")"
-    cp -a "$f" "$BACKUP_DIR/$f"
-    echo "备份 $f -> $BACKUP_DIR/$f"
-  fi
-}
-
-# join function
-join_by() { local IFS="$1"; shift; echo "$*"; }
-
-# apply for systemd-resolved via resolvectl (preferred)
-apply_systemd_resolved() {
-  if ! has_cmd resolvectl && ! has_cmd systemd-resolve; then
-    return 1
-  fi
-
-  # find interface
-  IFACE="$(get_default_iface)"
-  if [ -z "$IFACE" ]; then
-    echo "无法检测默认网络接口，systemd-resolved 模式跳过。"
-    return 1
-  fi
-
-  echo "尝试通过 systemd-resolved 修改 DNS（接口：$IFACE）..."
-  # backup resolved.conf & resolv.conf
-  backup_file "/etc/systemd/resolved.conf"
-  backup_file "/etc/resolv.conf"
-
-  # prefer using resolvectl if exists
-  if has_cmd resolvectl; then
-    echo "使用 resolvectl 设置 DNS： ${DNS_SERVERS[*]}"
-    # first clear any previous DNS for the iface
-    resolvectl revert "$IFACE" >/dev/null 2>&1 || true
-    # set DNS for the iface
-    resolvectl dns "$IFACE" ${DNS_SERVERS[*]}
-    # ensure systemd-resolved running
-    systemctl restart systemd-resolved || true
-  else
-    # fallback: create drop-in for resolved
-    local confdir="/etc/systemd/resolved.conf.d"
-    mkdir -p "$confdir"
-    local conf="$confdir/custom-dns.conf"
-    echo "Writing $conf"
-    {
-      echo "[Resolve]"
-      echo "DNS=$(join_by ' ' "${DNS_SERVERS[@]}")"
-      echo "Domains="
-      echo "FallbackDNS="
-    } > "$conf"
-    systemctl restart systemd-resolved
-  fi
-
-  # update /etc/resolv.conf symlink if necessary
-  if [ -L /etc/resolv.conf ]; then
-    RESLINK="$(readlink -f /etc/resolv.conf)"
-    echo "/etc/resolv.conf is symlinked to $RESLINK"
-  else
-    # recreate resolver file pointing to stub resolver if required
-    echo "注意：/etc/resolv.conf 不是符号链接；systemd-resolved 可能不会管理本机解析文件。"
-  fi
-
-  echo "systemd-resolved 配置已尝试更新。"
-  return 0
-}
-
-# apply for NetworkManager via nmcli
-apply_nmcli() {
-  if ! has_cmd nmcli; then
-    return 1
-  fi
-
-  echo "检测到 NetworkManager (nmcli)。尝试修改活动连接的 DNS..."
-  # list active connection
-  ACTIVE_CONN="$(nmcli -t -f NAME,DEVICE c show --active | head -n1 | cut -d: -f1)"
-  if [ -z "$ACTIVE_CONN" ]; then
-    # fallback: try connection associated with default iface
-    IFACE="$(get_default_iface)"
-    if [ -n "$IFACE" ]; then
-      ACTIVE_CONN="$(nmcli -t -f NAME,DEVICE c show --active | awk -F: -v d="$IFACE" '$2==d{print $1;exit}')"
-    fi
-  fi
-
-  if [ -z "$ACTIVE_CONN" ]; then
-    echo "未能找到活动连接，nmcli 修改跳过。"
-    return 1
-  fi
-
-  echo "活动连接: $ACTIVE_CONN"
-  # backup connection file? nmcli doesn't use a single file - we will export current settings as a backup
-  nmcli connection export "$ACTIVE_CONN" "$BACKUP_DIR/${ACTIVE_CONN}.nmconnection" >/dev/null 2>&1 || true
-  echo "已导出连接配置到 $BACKUP_DIR/${ACTIVE_CONN}.nmconnection"
-
-  # set DNS (ipv4)
-  DNS_CSV="$(join_by , "${DNS_SERVERS[@]}")"
-  nmcli connection modify "$ACTIVE_CONN" ipv4.ignore-auto-dns yes ipv4.dns "$DNS_CSV"
-  # bring connection down/up
-  nmcli connection up "$ACTIVE_CONN"
-  echo "NetworkManager 配置已更新为: $DNS_CSV"
-  return 0
-}
-
-# fallback: direct /etc/resolv.conf
-apply_resolv_conf() {
-  echo "尝试直接修改 /etc/resolv.conf（备份并写入）..."
-  backup_file "/etc/resolv.conf"
-  cat > /etc/resolv.conf <<EOF
-# Generated by change_dns.sh at ${TIMESTAMP}
+# ----------------------------
+# 5. 写入全新的 resolv.conf
+# ----------------------------
+echo "✍️ 重建 /etc/resolv.conf"
+cat > /etc/resolv.conf <<EOF
+# Generated by reset_dns.sh at $TIMESTAMP
 $(for d in "${DNS_SERVERS[@]}"; do echo "nameserver $d"; done)
+options timeout:2 attempts:2 rotate
 EOF
-  echo "/etc/resolv.conf 已写入。注意：某些系统（NetworkManager、systemd-resolved）可能会覆盖此文件。"
-  return 0
-}
 
-# Try to apply in order
-APPLIED=0
-if apply_systemd_resolved; then
-  APPLIED=1
+chmod 644 /etc/resolv.conf
+
+# ----------------------------
+# 6. DNS 生效验证
+# ----------------------------
+echo "🔍 开始 DNS 验证..."
+echo ""
+
+TEST_DOMAIN="example.com"
+
+if command -v dig >/dev/null 2>&1; then
+  TOOL="dig"
+elif command -v nslookup >/dev/null 2>&1; then
+  TOOL="nslookup"
+elif command -v host >/dev/null 2>&1; then
+  TOOL="host"
 else
-  echo "systemd-resolved 未应用或不存在，继续尝试其它方法..."
+  TOOL="none"
 fi
-
-if [ "$APPLIED" -eq 0 ]; then
-  if apply_nmcli; then
-    APPLIED=1
-  else
-    echo "NetworkManager 未应用或失败，继续尝试写 /etc/resolv.conf ..."
-  fi
-fi
-
-if [ "$APPLIED" -eq 0 ]; then
-  apply_resolv_conf || true
-  APPLIED=1
-fi
-
-echo "------ 配置阶段完成 ------"
-echo "备份目录：$BACKUP_DIR"
-echo "现在进行验证："
-
-# Choose an available DNS test tool
-TEST_TOOL=""
-if has_cmd dig; then
-  TEST_TOOL="dig"
-elif has_cmd nslookup; then
-  TEST_TOOL="nslookup"
-elif has_cmd host; then
-  TEST_TOOL="host"
-fi
-
-test_domain="example.com"
-echo "将使用域名 $test_domain 进行查询测试。"
 
 for dns in "${DNS_SERVERS[@]}"; do
-  echo "---- 测试 DNS: $dns ----"
-  if [ -n "$TEST_TOOL" ]; then
-    case "$TEST_TOOL" in
-      dig)
-        echo "使用 dig 进行测试..."
-        if dig @"$dns" +time=2 +tries=1 +short "$test_domain"; then
-          echo "dig 查询成功（返回 IP 列表或空行表示解析成功/无记录）。"
-        else
-          echo "dig 查询失败（查询超时或拒绝）。"
-        fi
-        ;;
-      nslookup)
-        echo "使用 nslookup 进行测试..."
-        if nslookup "$test_domain" "$dns"; then
-          echo "nslookup 查询执行完毕。"
-        else
-          echo "nslookup 查询失败。"
-        fi
-        ;;
-      host)
-        echo "使用 host 进行测试..."
-        if host "$test_domain" "$dns"; then
-          echo "host 查询成功。"
-        else
-          echo "host 查询失败。"
-        fi
-        ;;
-    esac
-  else
-    echo "系统没有可用的 dig/nslookup/host。尝试使用 getent 测试系统默认解析（注意：这不指定特定 DNS）。"
-    if getent ahosts "$test_domain" >/dev/null 2>&1; then
-      getent ahosts "$test_domain"
-      echo "getent 能解析 $test_domain（通过系统默认解析器）。但无法针对指定 DNS 服务器做单独测试。"
-    else
-      echo "getent 也无法解析。若想安装 dig（推荐），在 Debian/Ubuntu 上运行：apt update && apt install -y dnsutils"
-      # try to guess package manager and show install command
-      if has_cmd apt; then
-        echo "Debian/Ubuntu: sudo apt update && sudo apt install -y dnsutils"
-      elif has_cmd yum; then
-        echo "RHEL/CentOS: sudo yum install -y bind-utils"
-      elif has_cmd dnf; then
-        echo "Fedora: sudo dnf install -y bind-utils"
-      elif has_cmd pacman; then
-        echo "Arch: sudo pacman -S bind-tools"
-      fi
-    fi
-  fi
+  echo "➡️ 测试 DNS：$dns"
+
+  case "$TOOL" in
+    dig)
+      dig @"$dns" "$TEST_DOMAIN" +time=2 +tries=1 +short && echo "✅ 成功" || echo "❌ 失败"
+      ;;
+    nslookup)
+      nslookup "$TEST_DOMAIN" "$dns" && echo "✅ 成功" || echo "❌ 失败"
+      ;;
+    host)
+      host "$TEST_DOMAIN" "$dns" && echo "✅ 成功" || echo "❌ 失败"
+      ;;
+    *)
+      echo "⚠️ 未安装 dig/nslookup/host，跳过单独 DNS 验证"
+      getent ahosts "$TEST_DOMAIN" && echo "✅ 系统解析正常" || echo "❌ 系统解析失败"
+      ;;
+  esac
+
+  echo ""
 done
 
-echo "------ 验证完成 ------"
-echo "如果需要恢复原始配置，可在备份目录找到备份文件并手动恢复。"
-echo "示例恢复（/etc/resolv.conf）:"
-echo "  sudo cp -a $BACKUP_DIR/etc/resolv.conf /etc/resolv.conf"
+# ----------------------------
+# 7. 当前系统 DNS 状态
+# ----------------------------
+echo "📡 当前生效的 /etc/resolv.conf："
+cat /etc/resolv.conf
+
 echo ""
-echo "脚本完成。"
+echo "✅ DNS 彻底重置完成！"
+echo "📂 备份目录：$BACKUP_DIR"
+
+echo ""
+echo "🔁 如需回滚："
+echo "sudo cp -a $BACKUP_DIR/resolv.conf.link.bak /etc/resolv.conf"
